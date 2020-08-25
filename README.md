@@ -16,3 +16,34 @@ Required plus nice to haves
 apt install gcc build-essential libzmq3-dev pkg-config glances
 
 ```
+
+#### Streaming a file (like a video through VLC)
+
+Start up order does not matter since nothing runs until everything is connected
+
+Start the proxy at a well known ip
+```
+cargo run --release -- -vv start --routine wuproxy -1 tcp://0.0.0.0:5555 -2 tcp://0.0.0.0:5556 --socket-type proxy
+```
+
+Start the data generator
+```
+mkfifo stream.h264
+raspivid -ih -n -t 0 -o stream.h264
+```
+
+Start the stream server
+```
+cargo run --release -- -v start --routine streamfile -1 tcp://<well known ip address>:5555 --socket-type server
+```
+
+Start the N stream client
+```
+mkfifo stream.h264
+cargo run --release -- -v start --routine streamfile -1 tcp://<well known ip address>:5556 --socket-type client
+```
+
+Consume stream data
+```
+vlc stream.h264 :demux=h264
+```
