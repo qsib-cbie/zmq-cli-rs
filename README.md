@@ -23,7 +23,7 @@ Start up order does not matter since nothing runs until everything is connected
 
 Start the proxy at a well known ip
 ```
-cargo run --release -- -vv start --routine wuproxy -1 tcp://0.0.0.0:5555 -2 tcp://0.0.0.0:5556 --socket-type proxy
+cargo run --release -- -vv start --routine streamfile -1 tcp://0.0.0.0:5555 -2 tcp://0.0.0.0:5556 --socket-type proxy
 ```
 
 Start the data generator
