@@ -57,6 +57,7 @@ impl RtDealer {
                 broker.send("Fired!", 0)?;
                 workers_fired += 1;
                 if workers_fired >= worker_pool_size {
+                    log::info!("All workers are fired");
                     break;
                 }
             }
@@ -87,13 +88,13 @@ impl RtDealer {
             worker.recv_bytes(0)?;
             let workload = worker.recv_string(0)??;
             if workload == "Fired!" {
-                log::error!("Worker {} completed {} tasks", hex(&identity), total);
+                log::info!("Worker {} completed {} tasks", hex(&identity), total);
                 break;
             }
             total += 1;
 
             // Do some random work
-            std::thread::sleep(std::time::Duration::from_millis(rng.gen_range(1,500)));
+            std::thread::sleep(std::time::Duration::from_millis(rng.gen_range(1,50)));
 
             log::debug!("Finished work!");
         }
@@ -102,6 +103,75 @@ impl RtDealer {
         Ok(())
     }
 
+}
+
+struct WuProxy { }
+
+impl WuProxy {
+    fn wuproxy(front_endpoint: &str, back_endpoint: &str) -> Result<(), CliError> {
+        log::info!("Starting proxy for {} and {}", front_endpoint, back_endpoint);
+
+        let ctx = zmq::Context::new();
+        let frontend = ctx.socket(zmq::XSUB)?;
+        let backend = ctx.socket(zmq::XPUB)?;
+
+        frontend.bind(front_endpoint)?;
+        backend.bind(back_endpoint)?;
+
+        log::info!("Bound and beginning proxy");
+
+        zmq::proxy(&frontend, &backend)?;
+
+        Ok(())
+    }
+
+    fn wuclient(endpoint: &str, filter: Option<&str>) -> Result<(), CliError> {
+        log::info!("Starting client for {} with filter '{}'", endpoint, filter.unwrap_or(""));
+
+        let ctx = zmq::Context::new();
+        let subscriber = ctx.socket(zmq::SUB)?;
+        subscriber.connect(endpoint)?;
+
+        let mut filter_string = "";
+        if filter.is_some() {
+            filter_string = filter.unwrap();
+            subscriber.set_subscribe(filter_string.as_bytes())?;
+        }
+
+        log::info!("Subscribed and beginning processing stream");
+
+        let mut total_temp = 0;
+        for _ in 0..100 {
+            let string = subscriber.recv_string(0)??;
+            log::trace!("Processing: {}", string);
+            let chks: Vec<i64> = string.split(' ').map(|s| { s.parse().unwrap() }).collect();
+            let (_zipcode, temperature, _relhumidity) = (chks[0], chks[1], chks[2]);
+            total_temp += temperature;
+        }
+
+        log::info!("Average temperature for zipcode '{}' was {}F", filter_string, (total_temp / 100));
+ 
+        Ok(())
+    }
+
+    fn wuserver(endpoint: &str) -> Result<(), CliError> {
+        log::info!("Starting server for {}", endpoint);
+
+        let ctx = zmq::Context::new();
+        let publisher = ctx.socket(zmq::PUB)?;
+        publisher.connect(endpoint)?;
+
+        let mut rng = rand::thread_rng();
+
+        loop {
+            let zipcode = rng.gen_range(0, 100_000);
+            let temperature = rng.gen_range(-100, 100);
+            let relhumidity = rng.gen_range(10, 50);
+
+            let update = format!("{:05} {} {}", zipcode, temperature, relhumidity);
+            publisher.send(&update, 0)?;
+        }
+    }
 }
 
 
@@ -124,13 +194,24 @@ fn main() -> Result<(), CliError> {
                 .help("The type of socket to create")
                 .takes_value(true)
                 .required(true))
-            .arg(clap::Arg::with_name("endpoint")
-                .short("e")
-                .long("endpoint")
-                .value_name("endpoint")
-                .help("Bind like tcp://*:0 or Connect like tcp://0.0.0.0:5555")
-                .takes_value(true)
-                .required(true))
+            .arg(clap::Arg::with_name("primary_endpoint")
+                .short("1")
+                .long("primary_endpoint")
+                .value_name("ENDPOINT")
+                .help("Bind/Connect like tcp://*:0 or tcp://0.0.0.0:5555")
+                .takes_value(true))
+            .arg(clap::Arg::with_name("secondary_endpoint")
+                .short("2")
+                .long("secondary_endpoint")
+                .value_name("ENDPOINT")
+                .help("Bind/Connect like tcp://*:0 or tcp://0.0.0.0:5555")
+                .takes_value(true))
+            .arg(clap::Arg::with_name("filter")
+                .short("f")
+                .long("filter")
+                .value_name("FILTER")
+                .help("A subscribe filter if a subscriber is created")
+                .takes_value(true))
             .arg(clap::Arg::with_name("routine")
                 .short("r")
                 .long("routine")
@@ -161,6 +242,15 @@ fn main() -> Result<(), CliError> {
             Some("dealer") => {
                 (zmq::DEALER, "dealer")
             },
+            Some("server") => {
+                (zmq::PUB, "server")
+            },
+            Some("client") => {
+                (zmq::SUB, "client")
+            },
+            Some("proxy") => {
+                (zmq::XPUB, "proxy")
+            },
             Some(unknown) => {
                 log::error!("Unknown socket type: {}", unknown);
                 panic!("Invalid socket type");
@@ -171,18 +261,19 @@ fn main() -> Result<(), CliError> {
             }
         };
 
-        let endpoint = matches.value_of("endpoint").unwrap();
+        let primary_endpoint = matches.value_of("primary_endpoint");
+        let secondary_endpoint= matches.value_of("secondary_endpoint");
 
-        log::info!("Preparing {} socket for {}", socket_type_name, endpoint);
+        log::info!("Preparing {} socket for '{}' and '{}'", socket_type_name, primary_endpoint.unwrap_or(""), secondary_endpoint.unwrap_or(""));
         
         match matches.value_of("routine") {
             Some("rtdealer") => {
                 match socket_type {
                     zmq::ROUTER => {
-                        return RtDealer::router(endpoint);
+                        return RtDealer::router(primary_endpoint.unwrap());
                     },
                     zmq::DEALER => {
-                        return RtDealer::dealer(endpoint);
+                        return RtDealer::dealer(primary_endpoint.unwrap());
                     },
                     _ => {
                         let routine = "rtdealer";
@@ -190,7 +281,24 @@ fn main() -> Result<(), CliError> {
                         panic!("Cannot procede");
                     }
                 }
-
+            },
+            Some("wuproxy") => {
+                match socket_type_name {
+                    "proxy" => {
+                        return WuProxy::wuproxy(primary_endpoint.unwrap(), secondary_endpoint.unwrap());
+                    },
+                    "server" => {
+                        return WuProxy::wuserver(primary_endpoint.unwrap());
+                    },
+                    "client" => {
+                        return WuProxy::wuclient(primary_endpoint.unwrap(), matches.value_of("filter"));
+                    },
+                    _ => {
+                        let routine = "WuProxy";
+                        log::error!("Invalid socket type {} for routine {}", socket_type_name, routine);
+                        panic!("Cannot procede");
+                    }
+                }
             },
             _ => {
                 log::error!("Unknown routine for socket of type req");
