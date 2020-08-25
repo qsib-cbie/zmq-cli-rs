@@ -220,10 +220,21 @@ impl StreamFile {
 
         let mut input = std::fs::File::open(file_path)?;
         let mut byte_buffer = vec![0; 4096];
+        let mut stall_time = std::time::Instant::now();
+        let allowed_duration = std::time::Duration::new(30, 0);
+        let half_allowed_duration = std::time::Duration::new(15, 0);
         loop {
             let bytes_read = input.read(&mut byte_buffer).unwrap_or(0);
             if bytes_read > 0 {
                 publisher.send(&byte_buffer[0..bytes_read], 0)?;
+                if stall_time.elapsed() > half_allowed_duration {
+                    stall_time = std::time::Instant::now();
+                }
+            } else {
+                if stall_time.elapsed() > allowed_duration {
+                    // Restart streaming
+                    input = std::fs::File::open(file_path)?;
+                }
             }
         }
     }
@@ -240,15 +251,13 @@ impl StreamFile {
 
         let mut output = std::fs::File::create(file_path)?;
 
-        for _ in 0..100_000 {
+        loop {
             let data = subscriber.recv_bytes(0)?;
             let mut pos = 0;
             while pos < data.len() {
                 pos += output.write(&data[pos..])?;
             }
         }
-
-        Ok(())
     }
 }
 
