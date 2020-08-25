@@ -1,9 +1,24 @@
 use rand::Rng;
+use std::io::prelude::*;
 
 #[derive(Debug)]
 enum CliError {
+    StdError(Box<dyn std::error::Error>),
+    IoError(std::io::Error),
     ZmqError(zmq::Error),
     InvalidStringError(String),
+}
+
+impl std::convert::From<Box<dyn std::error::Error>> for CliError {
+    fn from(err: Box<dyn std::error::Error>) -> Self {
+        CliError::StdError(err)
+    }
+}
+
+impl std::convert::From<std::io::Error> for CliError {
+    fn from(err: std::io::Error) -> Self {
+        CliError::IoError(err)
+    }
 }
 
 impl std::convert::From<zmq::Error> for CliError {
@@ -143,7 +158,7 @@ impl WuProxy {
         log::info!("Subscribed and beginning processing stream");
 
         let mut total_temp = 0;
-        for _ in 0..100 {
+        for _ in 0..100_000_000 {
             let string = subscriber.recv_string(0)??;
             log::trace!("Processing: {}", string);
             let chks: Vec<i64> = string.split(' ').map(|s| { s.parse().unwrap() }).collect();
@@ -176,6 +191,66 @@ impl WuProxy {
     }
 }
 
+struct StreamFile {} 
+
+impl StreamFile {
+    fn proxy(front_endpoint: &str, back_endpoint: &str) -> Result<(), CliError> {
+        log::info!("Starting proxy for {} and {}", front_endpoint, back_endpoint);
+
+        let ctx = zmq::Context::new();
+        let frontend = ctx.socket(zmq::XSUB)?;
+        let backend = ctx.socket(zmq::XPUB)?;
+
+        frontend.bind(front_endpoint)?;
+        backend.bind(back_endpoint)?;
+
+        log::info!("Bound and beginning proxy");
+
+        zmq::proxy(&frontend, &backend)?;
+
+        Ok(())
+    }
+
+    fn server(endpoint: &str, file_path: &str) -> Result<(), CliError> {
+        log::info!("Starting client for {} with file_path {}", endpoint, file_path);
+
+        let ctx = zmq::Context::new();
+        let publisher = ctx.socket(zmq::PUB)?;
+        publisher.connect(endpoint)?;
+
+        let mut input = std::fs::File::open(file_path)?;
+        let mut byte_buffer = vec![0; 4096];
+        loop {
+            let bytes_read = input.read(&mut byte_buffer).unwrap_or(0);
+            if bytes_read > 0 {
+                publisher.send(&byte_buffer[0..bytes_read], 0)?;
+            }
+        }
+    }
+
+    fn client(endpoint: &str, file_path: &str) -> Result<(), CliError> {
+        log::info!("Starting client for {} with file_path {}", endpoint, file_path);
+
+        let ctx = zmq::Context::new();
+        let subscriber = ctx.socket(zmq::SUB)?;
+        subscriber.connect(endpoint)?;
+        subscriber.set_subscribe(&vec![])?;
+
+        log::info!("Subscribed and beginning processing stream");
+
+        let mut output = std::fs::File::create(file_path)?;
+
+        for _ in 0..100_000 {
+            let data = subscriber.recv_bytes(0)?;
+            let mut pos = 0;
+            while pos < data.len() {
+                pos += output.write(&data[pos..])?;
+            }
+        }
+
+        Ok(())
+    }
+}
 
 fn main() -> Result<(), CliError> {
     // Define the acceptable user input behavior
@@ -213,6 +288,12 @@ fn main() -> Result<(), CliError> {
                 .long("filter")
                 .value_name("FILTER")
                 .help("A subscribe filter if a subscriber is created")
+                .takes_value(true))
+            .arg(clap::Arg::with_name("file_path")
+                .short("p")
+                .long("file-path")
+                .value_name("FILE_PATH")
+                .help("A file path to use if the routine needs one")
                 .takes_value(true))
             .arg(clap::Arg::with_name("routine")
                 .short("r")
@@ -302,8 +383,29 @@ fn main() -> Result<(), CliError> {
                     }
                 }
             },
+            Some("streamfile") => {
+                match socket_type_name {
+                    "proxy" => {
+                        return StreamFile::proxy(primary_endpoint.unwrap(), secondary_endpoint.unwrap());
+                    },
+                    "server" => {
+                        return StreamFile::server(primary_endpoint.unwrap(), matches.value_of("file_path").unwrap());
+                    },
+                    "client" => {
+                        return StreamFile::client(primary_endpoint.unwrap(), matches.value_of("file_path").unwrap());
+                    },
+                    _ => {
+                        let routine = "StreamFile";
+                        log::error!("Invalid socket type {} for routine {}", socket_type_name, routine);
+                        panic!("Cannot procede");
+                    }
+                }
+            },            
+            Some(routine) => {
+                log::error!("Unknown routine {} for socket type {}", routine, socket_type_name);
+            },
             _ => {
-                log::error!("Unknown routine for socket of type req");
+                log::error!("Routine must be specified");
             }
         }
     }
