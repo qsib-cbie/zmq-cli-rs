@@ -136,6 +136,8 @@ impl WuProxy {
         if filter.is_some() {
             filter_string = filter.unwrap();
             subscriber.set_subscribe(filter_string.as_bytes())?;
+        } else {
+            subscriber.set_subscribe(&vec![])?;
         }
 
         log::info!("Subscribed and beginning processing stream");
