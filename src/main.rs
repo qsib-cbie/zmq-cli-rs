@@ -204,7 +204,7 @@ impl StreamFile {
         frontend.bind(front_endpoint)?;
         backend.bind(back_endpoint)?;
 
-        log::info!("Bound and beginning proxy");
+        log::info!("Bound and beginning proxy as XSUB to XPUB");
 
         zmq::proxy(&frontend, &backend)?;
 
@@ -253,6 +253,95 @@ impl StreamFile {
 
         loop {
             let data = subscriber.recv_bytes(0)?;
+            let mut pos = 0;
+            while pos < data.len() {
+                pos += output.write(&data[pos..])?;
+            }
+        }
+    }
+}
+
+struct RRBroker {}
+
+impl RRBroker {
+    pub fn proxy(front_endpoint: &str, back_endpoint: &str) -> Result<(), CliError> {
+        log::info!("Starting proxy for {} and {}", front_endpoint, back_endpoint);
+
+        let ctx = zmq::Context::new();
+        let frontend = ctx.socket(zmq::ROUTER)?;
+        let backend = ctx.socket(zmq::DEALER)?;
+
+        frontend.bind(front_endpoint)?;
+        backend.bind(back_endpoint)?;
+
+        log::info!("Bound and beginning proxy as ROUTER:DEALER");
+
+        zmq::proxy(&frontend, &backend)?;
+
+        Ok(())
+    }
+
+    pub fn client(endpoint: &str, file_path: &str) -> Result<(), CliError> {
+        log::info!("Starting client for {} with file_path {}", endpoint, file_path);
+
+        let ctx = zmq::Context::new();
+        let client = ctx.socket(zmq::DEALER)?;
+        client.connect(endpoint)?;
+
+        log::info!("Connected to {} as DEALER", endpoint);
+
+        let mut input = std::fs::File::open(file_path)?;
+        let mut byte_buffer = vec![0; 4096];
+        let mut stall_time = std::time::Instant::now();
+        let allowed_duration = std::time::Duration::new(2, 0);
+        let half_allowed_duration = std::time::Duration::new(1, 0);
+        loop {
+            // Send data if possible
+            let bytes_read = input.read(&mut byte_buffer).unwrap_or(0);
+            if bytes_read > 0 {
+                client.send(vec![], zmq::SNDMORE)?;           // Simulate REQ with empty frame then message
+                client.send(&byte_buffer[0..bytes_read], 0)?; // Simulate REQ with message content after empty frame
+                if stall_time.elapsed() > half_allowed_duration {
+                    stall_time = std::time::Instant::now();
+                }
+            } else {
+                if stall_time.elapsed() > allowed_duration {
+                    // Restart streaming
+                    input = std::fs::File::open(file_path)?;
+                }
+            }
+
+            // Read data if possible
+            if client.poll(zmq::POLLIN, 0)? != 0 {
+                let _ = client.recv_bytes(0)?;                      // Simulate REQ (Identity stripped off by ROUTER) start with empty frame
+                let data = client.recv_bytes(0)?;          // Simulate REQ message content after empty frame
+                log::debug!("Received message: '{:?}'", String::from_utf8(data));
+            }
+        }
+    }
+
+    pub fn worker(endpoint: &str, file_path: &str) -> Result<(), CliError> {
+        log::info!("Starting worker for {} with file_path {}", endpoint, file_path);
+
+        let ctx = zmq::Context::new();
+        let worker = ctx.socket(zmq::DEALER)?;
+        worker.connect(endpoint)?;
+
+        log::info!("Connected to {} as DEALER", endpoint);
+
+        let mut output = std::fs::File::create(file_path)?;
+
+        loop {
+            let id = worker.recv_bytes(0)?;     // Identity
+            let _ = worker.recv_bytes(0)?;               // Empty Frame
+            let data = worker.recv_bytes(0)?;   // Mesasge Content
+            let copy = data.clone();
+            log::debug!("Received message: '{:?}' from: '{}'", String::from_utf8(copy), hex(id.as_slice()));
+
+            worker.send(id, zmq::SNDMORE)?;        // Identity
+            worker.send(vec![], zmq::SNDMORE)?;    // Empty Frame
+            worker.send(data.as_slice(), 0)?;      // Message Content
+
             let mut pos = 0;
             while pos < data.len() {
                 pos += output.write(&data[pos..])?;
@@ -327,22 +416,13 @@ fn main() -> Result<(), CliError> {
     if let Some(matches) = matches.subcommand_matches("start") {
         log::trace!("CLI Params: {:#?}", matches);
 
-        let (socket_type, socket_type_name)  = match matches.value_of("socket_type") {
-            Some("router") => {
-                (zmq::ROUTER, "router")
-            },
-            Some("dealer") => {
-                (zmq::DEALER, "dealer")
-            },
-            Some("server") => {
-                (zmq::PUB, "server")
-            },
-            Some("client") => {
-                (zmq::SUB, "client")
-            },
-            Some("proxy") => {
-                (zmq::XPUB, "proxy")
-            },
+        let socket_type_name = match matches.value_of("socket_type") {
+            Some("router") => "router",
+            Some("dealer") => "deadler",
+            Some("server") => "server",
+            Some("client") => "client",
+            Some("worker") => "worker",
+            Some("proxy") =>  "proxy",
             Some(unknown) => {
                 log::error!("Unknown socket type: {}", unknown);
                 panic!("Invalid socket type");
@@ -360,11 +440,11 @@ fn main() -> Result<(), CliError> {
         
         match matches.value_of("routine") {
             Some("rtdealer") => {
-                match socket_type {
-                    zmq::ROUTER => {
+                match socket_type_name {
+                    "router"=> {
                         return RtDealer::router(primary_endpoint.unwrap());
                     },
-                    zmq::DEALER => {
+                    "dealer" => {
                         return RtDealer::dealer(primary_endpoint.unwrap());
                     },
                     _ => {
@@ -405,6 +485,24 @@ fn main() -> Result<(), CliError> {
                     },
                     _ => {
                         let routine = "StreamFile";
+                        log::error!("Invalid socket type {} for routine {}", socket_type_name, routine);
+                        panic!("Cannot procede");
+                    }
+                }
+            },            
+            Some("rrbroker") => {
+                match socket_type_name {
+                    "proxy" => {
+                        return RRBroker::proxy(primary_endpoint.unwrap(), secondary_endpoint.unwrap());
+                    },
+                    "client" => {
+                        return RRBroker::client(primary_endpoint.unwrap(), matches.value_of("file_path").unwrap());
+                    },
+                    "worker" => {
+                        return RRBroker::worker(primary_endpoint.unwrap(), matches.value_of("file_path").unwrap());
+                    },
+                    _ => {
+                        let routine = "RRBroker";
                         log::error!("Invalid socket type {} for routine {}", socket_type_name, routine);
                         panic!("Cannot procede");
                     }
